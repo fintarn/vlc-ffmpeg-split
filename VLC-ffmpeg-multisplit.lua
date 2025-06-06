@@ -1,7 +1,7 @@
 function descriptor()
   return {
     title = "Split: Mark In/Out (Multiple) and Create Clip",
-    version = "1.0",
+    version = "1.1",
     author = "fintarn",
     url = "https://github.com/fintarn/vlc-ffmpeg-split",
     shortdesc = "Split and concat multiple clips with ffmpeg",
@@ -20,14 +20,23 @@ for i = 1, 10 do
   mark_points[i] = { mark_in = nil, mark_out = nil }
 end
 
-function file_exists(path)
-  local f = io.open(path, "r")
-  if f then f:close() return true else return false end
+-- Utility: Check if file exists
+function file_exists(name)
+  vlc.msg.dbg("Checking if file exists: " .. name)
+  local f = vlc.io.open(name, "r")
+  if f then
+    f:close()
+    vlc.msg.dbg("File exists: " .. name)
+    return true
+  else
+    vlc.msg.dbg("File doesn't exist.")
+    return false
+  end
 end
 
 function create_temp_dir(base_path)
   local temp_path = base_path .. "/ffmpeg_temp"
-  os.execute('mkdir "' .. temp_path .. '" >nul 2>&1')
+  vlc.io.mkdir(temp_path, "0700") -- safer, portable
   return temp_path
 end
 
@@ -38,6 +47,7 @@ function format_time(t)
   return string.format("%02d:%02d:%06.3f", hrs, mins, secs):gsub(",", ".")
 end
 
+-- Utility: Generate unique output filename to avoid overwrite
 function get_unique_output_filename(base, extension)
   local filename = base .. "_concat" .. extension
   local counter = 1
@@ -48,16 +58,20 @@ function get_unique_output_filename(base, extension)
   return filename
 end
 
+-- Utility: Unicode detector
+function contains_unicode(str)
+  -- Returns true if any byte in the string is above 127 (non-ASCII)
+  return string.find(str, "[\128-\255]") ~= nil
+end
+
 function check_overlap_ranges(points)
   local ranges = {}
-  for i, seg in ipairs(points) do
+  for _, seg in ipairs(points) do
     if seg.mark_in and seg.mark_out then
       table.insert(ranges, {start = seg.mark_in, stop = seg.mark_out})
     end
   end
-
   table.sort(ranges, function(a, b) return a.start < b.start end)
-
   for i = 2, #ranges do
     if ranges[i].start < ranges[i - 1].stop then
       return true, ranges[i - 1], ranges[i]
@@ -68,7 +82,6 @@ end
 
 function ensure_input_path()
   if input_file_path then return end
-
   local input_item = vlc.input.item()
   local uri = input_item and input_item:uri()
   if uri then
@@ -79,6 +92,35 @@ function ensure_input_path()
   end
 end
 
+-- Execute ffmpeg via PowerShell for Unicode-safe fallback
+function run_ffmpeg_via_powershell(cmd)
+  local temp_dir = os.getenv("TEMP") or "."
+  local ps1_path = temp_dir .. "\\vlc_ffmpeg_temp.ps1"
+
+  -- Write UTF-8 with BOM
+  local ps1_file = io.open(ps1_path, "wb")
+  if not ps1_file then
+    vlc.msg.err("Failed to create PowerShell script file.")
+    return -1
+  end
+  ps1_file:write(string.char(0xEF, 0xBB, 0xBF)) -- BOM
+  ps1_file:write(cmd .. "\n")
+  -- ps1_file:write("pause\n") -- Keep for debug; remove in production
+  ps1_file:close()
+
+  vlc.msg.dbg("PowerShell script written to: " .. ps1_path)
+
+  local exec_result = os.execute('powershell -ExecutionPolicy Bypass -File "' .. ps1_path .. '"')
+  if exec_result ~= 0 then
+    vlc.msg.err("ffmpeg PowerShell execution failed with exit code: " .. tostring(exec_result))
+  else
+    vlc.msg.dbg("ffmpeg command executed successfully via PowerShell.")
+  end
+
+  os.remove(ps1_path) -- Optional: clean up temp file, comment out for debug.
+  return exec_result
+end
+
 function activate()
   create_dialog()
 end
@@ -87,6 +129,7 @@ function deactivate() end
 function close() vlc.msg.dbg("Dialog closed") end
 function meta_changed() end
 
+-- Build the dialog UI
 function create_dialog()
   vlc.msg.dbg("Dialog created")
   local dlg = vlc.dialog("Split: Mark In/Out (Multiple)")
@@ -117,37 +160,30 @@ function create_dialog()
       if not input then return end
       mark_points[i].mark_in = vlc.var.get(input, "time") / 1000000
       refresh_labels()
-    end, 2, i, 1, 1)
-  
-    labels[i].out_label = dlg:add_label("Mark Out " .. i .. ": -", 3, i, 1, 1)
+    end, 2, i)
+
+    labels[i].out_label = dlg:add_label("Mark Out " .. i .. ": -", 3, i)
     dlg:add_button("Mark Out", function()
       ensure_input_path()
       local input = vlc.object.input()
       if not input then return end
       mark_points[i].mark_out = vlc.var.get(input, "time") / 1000000
       refresh_labels()
-    end, 4, i, 1, 1)
-  
-    -- 🆕 Clear Button for each segment
+    end, 4, i)
+
     dlg:add_button("Clear", function()
       mark_points[i].mark_in = nil
       mark_points[i].mark_out = nil
       labels[i].in_label:set_text("Mark In " .. i .. ": -")
       labels[i].out_label:set_text("Mark Out " .. i .. ": -")
       vlc.msg.dbg("Cleared Mark In/Out for segment " .. i)
-    end, 5, i, 1, 1)
-    
-    labels[i].up_btn = dlg:add_button("↑", function()
-      swap_marks(i, i - 1)
-    end, 6, i, 1, 1)
+    end, 5, i)
 
-    labels[i].down_btn = dlg:add_button("↓", function()
-      swap_marks(i, i + 1)
-    end, 7, i, 1, 1)    
-  
+    labels[i].up_btn = dlg:add_button("↑", function() swap_marks(i, i - 1) end, 6, i)
+    labels[i].down_btn = dlg:add_button("↓", function() swap_marks(i, i + 1) end, 7, i)
   end
 
-  checkbox_copyts = dlg:add_check_box("Use -copyts", false, 1, 11, 2, 1)
+  checkbox_copyts = dlg:add_check_box("Use -copyts", false, 1, 11, 2)
 
   dlg:add_button("Create Clip", function()
     if not input_file_path then
@@ -195,20 +231,39 @@ function create_dialog()
       return
     end
 
-
     for i, seg in ipairs(valid_segments) do
       local mark_in_fmt = format_time(seg.mark_in)
       local duration = seg.mark_out - seg.mark_in
       local duration_fmt = format_time(duration)
       local clip_path = ffmpeg_temp_dir .. "/part" .. i .. ext
 
-      local copyts_flag = (checkbox_copyts and checkbox_copyts:get_checked()) and " -copyts" or ""
+      local copyts_flag = checkbox_copyts and checkbox_copyts:get_checked() and "-copyts" or ""
+      local cmd = string.format('ffmpeg -y -i "%s" %s -ss %s -t %s -c copy "%s"',
+        input_file_path, copyts_flag, mark_in_fmt, duration_fmt, clip_path)
 
-      local cmd = string.format('ffmpeg -y -i "%s" -ss %s -t %s -c copy%s "%s"',
-        input_file_path, mark_in_fmt, duration_fmt, copyts_flag, clip_path)
+      vlc.msg.dbg("Running segment " .. i .. ": " .. cmd)
 
-      vlc.msg.dbg("Running: " .. cmd)
-      os.execute(cmd)
+      local result
+      if contains_unicode(input_file_path) or contains_unicode(clip_path) then
+        vlc.msg.warn("Unicode detected in ffmpeg command. Using PowerShell fallback.")
+        result = run_ffmpeg_via_powershell(cmd)
+      else
+        result = os.execute(cmd)
+        if result ~= 0 then
+          vlc.msg.err("ffmpeg command failed with exit code: " .. tostring(result))
+          vlc.msg.warn("Trying PowerShell fallback.")
+          result = run_ffmpeg_via_powershell(cmd)
+        else
+          vlc.msg.dbg("ffmpeg command executed successfully.")
+          vlc.msg.dbg("Exit code: " .. tostring(result))
+        end
+      end
+
+      if not file_exists(clip_path) then
+        vlc.msg.err("Expected output file was not created: " .. clip_path)
+        return
+      end
+
       list_file:write('file \'' .. clip_path:gsub("\\", "/") .. "'\n")
       table.insert(temp_files, clip_path)
     end
@@ -220,11 +275,29 @@ function create_dialog()
     local concat_cmd = string.format('ffmpeg -y -f concat -safe 0 -i "%s" -c copy "%s"',
       list_path, output)
     vlc.msg.dbg("Concatenating: " .. concat_cmd)
-    os.execute(concat_cmd)
+
+    local result
+    local filename_has_unicode = contains_unicode(list_path) or contains_unicode(output)
+    if filename_has_unicode then
+      vlc.msg.warn("Unicode detected in concat command. Using PowerShell fallback.")
+      result = run_ffmpeg_via_powershell(concat_cmd)
+    else
+      result = os.execute(concat_cmd)
+      if result ~= 0 or not file_exists(output) then
+        vlc.msg.err("Concat command failed or file not created.")
+        vlc.msg.warn("Trying PowerShell fallback.")
+        result = run_ffmpeg_via_powershell(concat_cmd)
+      end
+    end
+
+    if result == 0 then
+      vlc.msg.dbg("ffmpeg concatenate command executed successfully.")
+      vlc.msg.dbg("Exit code: " .. tostring(result))
+    end
 
     vlc.msg.dbg("Output file: " .. output)
     command_input:set_text(concat_cmd)
-  end, 1, 12, 2, 1)
+  end, 1, 12, 2)
 
   dlg:add_button("Clean Temp Files", function()
     if temp_files then
@@ -241,7 +314,7 @@ function create_dialog()
     end
     temp_files = {}
     ffmpeg_temp_dir = nil
-  end, 3, 12, 2, 1)
+  end, 3, 12, 2)
 
   dlg:add_button("Clear Marks", function()
     for i = 1, 10 do
@@ -252,9 +325,9 @@ function create_dialog()
     end
     command_input:set_text("")
     vlc.msg.dbg("Cleared all marks.")
-  end, 1, 13, 4, 1)
+  end, 1, 13, 4)
 
-  command_input = dlg:add_text_input("", 1, 14, 4, 1)
+  command_input = dlg:add_text_input("", 1, 14, 4)
 
   dlg:show()
 end
